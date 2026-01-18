@@ -13,10 +13,16 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    // Check for help flags
+    // Check for help flags (case-insensitive, handle variations)
     if (args.len >= 2) {
         const first_arg = args[1];
-        if (std.mem.eql(u8, first_arg, "-h") or std.mem.eql(u8, first_arg, "--help")) {
+        if (std.mem.eql(u8, first_arg, "-h") or 
+            std.mem.eql(u8, first_arg, "-H") or
+            std.mem.eql(u8, first_arg, "-help") or
+            std.mem.eql(u8, first_arg, "-Help") or
+            std.mem.eql(u8, first_arg, "--help") or
+            std.mem.eql(u8, first_arg, "--Help"))
+        {
             try printHelp();
             return;
         }
@@ -58,6 +64,15 @@ pub fn main() !void {
         var hist = try history.History.init(allocator, history_path);
         defer hist.deinit();
         try hist.record(path);
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "--clear")) {
+        const history_path = try history.History.getHistoryPath(allocator);
+        defer allocator.free(history_path);
+        try history.History.clear(allocator, history_path);
+        const stdout = std.fs.File.stdout();
+        try stdout.writeAll("History cleared\n");
         return;
     }
 
@@ -123,6 +138,7 @@ fn printHelp() !void {
         \\    goto <name>                    # Navigate to a directory
         \\    goto init <shell>              # Generate shell hook
         \\    goto --record <path>           # Record a directory in history
+        \\    goto --clear                   # Clear history
         \\    goto -h|--help                 # Show this help message
         \\
         \\COMMANDS:
@@ -135,12 +151,15 @@ fn printHelp() !void {
         \\
         \\    --record <path>                Manually add a directory to history
         \\
+        \\    --clear                         Clear all history
+        \\
         \\EXAMPLES:
         \\    goto pro                       # Navigate to a directory matching "pro"
         \\    cd $(goto pro)                # Use with shell (bash/zsh)
         \\    set -l dir (goto pro); cd $dir # Use with fish
         \\    goto init fish                 # Generate fish hook
         \\    goto --record /some/path       # Record a directory
+        \\    goto --clear                   # Clear history
         \\
         \\PRIORITY ORDER:
         \\    1. Priority directories from config

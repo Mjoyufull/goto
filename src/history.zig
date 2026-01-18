@@ -184,5 +184,16 @@ pub const History = struct {
         const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
         return std.fmt.allocPrint(allocator, "{s}/.local/share/fend/history", .{home});
     }
+
+    pub fn clear(_: std.mem.Allocator, history_path: []const u8) !void {
+        // Delete the history file
+        std.fs.deleteFileAbsolute(history_path) catch |err| {
+            if (err == error.FileNotFound) {
+                // File doesn't exist, that's fine
+                return;
+            }
+            return err;
+        };
+    }
 };
 
