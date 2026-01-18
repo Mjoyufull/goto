@@ -70,13 +70,24 @@ fn searchFilesystem(
 ) !void {
     const home = std.posix.getenv("HOME") orelse return;
 
-    // Search .config first
-    const config_dir = try std.fmt.allocPrint(allocator, "{s}/.config", .{home});
-    defer allocator.free(config_dir);
-    searchInDirectory(allocator, config_dir, pattern, results, exclude) catch {};
+    // First, check common project directories for exact matches
+    const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{home});
+    defer allocator.free(projects_dir);
+    
+    // Search projects directory first (shallow, depth 1) if it exists
+    searchInDirectoryWithDepth(allocator, projects_dir, pattern, results, exclude, 0, 1) catch {};
+    // If we found results, return early
+    if (results.items.len > 0) return;
 
-    // Then search home
-    searchInDirectory(allocator, home, pattern, results, exclude) catch {};
+    // Then search home directory (shallow, depth 2)
+    searchInDirectoryWithDepth(allocator, home, pattern, results, exclude, 0, 2) catch {};
+    
+    // If still no results, search .config (but with lower priority)
+    if (results.items.len == 0) {
+        const config_dir = try std.fmt.allocPrint(allocator, "{s}/.config", .{home});
+        defer allocator.free(config_dir);
+        searchInDirectory(allocator, config_dir, pattern, results, exclude) catch {};
+    }
 
     // Skip root search to avoid permission issues and long searches
 }

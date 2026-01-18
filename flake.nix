@@ -38,6 +38,8 @@
         }
       );
 
+      defaultPackage = forAllSystems (system: self.packages.${system}.default);
+
       apps = forAllSystems (system: {
         default = {
           type = "app";
