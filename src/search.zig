@@ -24,37 +24,122 @@ pub fn searchDirectories(
 
     const now = std.time.timestamp();
 
-    // Search history first
-    var history_matches = std.ArrayListUnmanaged(frecency.FrecencyEntry){};
+    const home = std.posix.getenv("HOME") orelse "";
+    
+    // First pass: collect basename matches only
+    var basename_matches = std.ArrayListUnmanaged(frecency.FrecencyEntry){};
     defer {
-        for (history_matches.items) |entry| {
+        for (basename_matches.items) |entry| {
             allocator.free(entry.path);
         }
-        history_matches.deinit(allocator);
+        basename_matches.deinit(allocator);
     }
-
+    
+    // Second pass: collect path-only matches (only if no basename matches)
+    var path_only_matches = std.ArrayListUnmanaged(frecency.FrecencyEntry){};
+    defer {
+        for (path_only_matches.items) |entry| {
+            allocator.free(entry.path);
+        }
+        path_only_matches.deinit(allocator);
+    }
+    
     for (hist.entries.items) |entry| {
         const basename = std.fs.path.basename(entry.path);
-        if (std.mem.indexOf(u8, basename, pattern) != null or
-            std.mem.indexOf(u8, entry.path, pattern) != null)
-        {
-            const score = frecency.calculateFrecency(entry.access_count, entry.last_accessed, now);
+        const basename_match: bool = std.mem.eql(u8, basename, pattern) or
+            std.mem.startsWith(u8, basename, pattern) or
+            std.mem.indexOf(u8, basename, pattern) != null;
+        const path_match: bool = std.mem.indexOf(u8, entry.path, pattern) != null and !basename_match;
+        
+        if (basename_match) {
+            const frecency_score = frecency.calculateFrecency(entry.access_count, entry.last_accessed, now);
+            // Boost score for exact basename matches
+            const match_boost: f64 = if (std.mem.eql(u8, basename, pattern))
+                1000.0
+            else if (std.mem.startsWith(u8, basename, pattern))
+                500.0
+            else if (basename_match)
+                200.0
+            else
+                50.0; // Path match only
+            
+            // Penalize longer paths
+            var depth: usize = 0;
+            for (entry.path) |c| {
+                if (c == '/') depth += 1;
+            }
+            const depth_penalty = @as(f64, @floatFromInt(depth)) * 10.0;
+            
+            const combined_score = frecency_score + match_boost - depth_penalty;
+            
             const path_copy = try allocator.dupe(u8, entry.path);
             errdefer allocator.free(path_copy);
-            try history_matches.append(allocator, frecency.FrecencyEntry{
+            try basename_matches.append(allocator, frecency.FrecencyEntry{
                 .path = path_copy,
-                .frecency = score,
+                .frecency = combined_score,
+                .access_count = entry.access_count,
+                .last_accessed = entry.last_accessed,
+            });
+        } else if (path_match) {
+            // Path-only match - heavily penalize
+            const frecency_score = frecency.calculateFrecency(entry.access_count, entry.last_accessed, now);
+            var depth: usize = 0;
+            for (entry.path) |c| {
+                if (c == '/') depth += 1;
+            }
+            const depth_penalty = @as(f64, @floatFromInt(depth)) * 50.0; // Much heavier penalty
+            const combined_score = frecency_score - depth_penalty - 500.0; // Heavy penalty for path-only
+            
+            const path_copy = try allocator.dupe(u8, entry.path);
+            errdefer allocator.free(path_copy);
+            try path_only_matches.append(allocator, frecency.FrecencyEntry{
+                .path = path_copy,
+                .frecency = combined_score,
                 .access_count = entry.access_count,
                 .last_accessed = entry.last_accessed,
             });
         }
     }
 
-    // Sort by frecency
-    try frecency.sortByFrecency(allocator, history_matches.items);
+    // Sort both lists
+    try frecency.sortByFrecency(allocator, basename_matches.items);
+    try frecency.sortByFrecency(allocator, path_only_matches.items);
+    
+    // Combine: basename matches first, then path-only matches (only if no basename matches)
+    var combined_history = std.ArrayListUnmanaged(frecency.FrecencyEntry){};
+    defer {
+        for (combined_history.items) |entry| {
+            allocator.free(entry.path);
+        }
+        combined_history.deinit(allocator);
+    }
+    
+    // Add all basename matches
+    for (basename_matches.items) |entry| {
+        const path_copy = try allocator.dupe(u8, entry.path);
+        try combined_history.append(allocator, frecency.FrecencyEntry{
+            .path = path_copy,
+            .frecency = entry.frecency,
+            .access_count = entry.access_count,
+            .last_accessed = entry.last_accessed,
+        });
+    }
+    
+    // Only add path-only matches if we have no basename matches
+    if (combined_history.items.len == 0) {
+        for (path_only_matches.items) |entry| {
+            const path_copy = try allocator.dupe(u8, entry.path);
+            try combined_history.append(allocator, frecency.FrecencyEntry{
+                .path = path_copy,
+                .frecency = entry.frecency,
+                .access_count = entry.access_count,
+                .last_accessed = entry.last_accessed,
+            });
+        }
+    }
 
     // Add history matches to results
-    for (history_matches.items) |entry| {
+    for (combined_history.items) |entry| {
         const path_copy = try allocator.dupe(u8, entry.path);
         try results.append(allocator, path_copy);
     }
@@ -64,6 +149,23 @@ pub fn searchDirectories(
         try searchFilesystem(allocator, pattern, &results, cfg.exclude);
         // Sort filesystem results by score (home first, then .config, shorter paths preferred)
         try sortFilesystemResults(allocator, &results, pattern);
+    } else {
+        // Even if we have history results, search filesystem and merge/sort together
+        // This ensures filesystem matches with better scores can rank higher
+        var filesystem_results = std.ArrayListUnmanaged([]const u8){};
+        
+        try searchFilesystem(allocator, pattern, &filesystem_results, cfg.exclude);
+        try sortFilesystemResults(allocator, &filesystem_results, pattern);
+        
+        // Merge and re-sort all results together by score
+        // mergeAndSortResults takes ownership of filesystem_results items
+        try mergeAndSortResults(allocator, &results, &filesystem_results, pattern, home);
+        
+        // Free any remaining filesystem_results that weren't merged
+        for (filesystem_results.items) |item| {
+            allocator.free(item);
+        }
+        filesystem_results.deinit(allocator);
     }
 
     return results;
@@ -257,4 +359,91 @@ fn sortFilesystemResults(
     // Clear scored without freeing (ownership transferred)
     scored.clearRetainingCapacity();
     scored.deinit(allocator);
+}
+
+fn mergeAndSortResults(
+    allocator: std.mem.Allocator,
+    history_results: *std.ArrayListUnmanaged([]const u8),
+    filesystem_results: *std.ArrayListUnmanaged([]const u8),
+    pattern: []const u8,
+    home: []const u8,
+) !void {
+    // Combine all results with scores
+    var all_scored = std.ArrayListUnmanaged(ScoredPath){};
+    errdefer {
+        for (all_scored.items) |entry| {
+            allocator.free(entry.path);
+        }
+        all_scored.deinit(allocator);
+    }
+    
+    // Add history results (they already have some priority from frecency)
+    for (history_results.items) |path| {
+        const score = calculatePathScore(path, pattern, home) + 100.0; // Small boost for history
+        const path_copy = try allocator.dupe(u8, path);
+        errdefer allocator.free(path_copy);
+        try all_scored.append(allocator, ScoredPath{
+            .path = path_copy,
+            .score = score,
+        });
+    }
+    
+    // Add filesystem results
+    for (filesystem_results.items) |path| {
+        const score = calculatePathScore(path, pattern, home);
+        const path_copy = try allocator.dupe(u8, path);
+        errdefer allocator.free(path_copy);
+        try all_scored.append(allocator, ScoredPath{
+            .path = path_copy,
+            .score = score,
+        });
+    }
+    
+    // Sort all by score
+    const SortContext = struct {
+        pub fn lessThan(ctx: @This(), a: ScoredPath, b: ScoredPath) bool {
+            _ = ctx;
+            return a.score > b.score;
+        }
+    };
+    const sort_ctx = SortContext{};
+    std.mem.sort(ScoredPath, all_scored.items, sort_ctx, SortContext.lessThan);
+    
+    // Clear and repopulate history_results with sorted order
+    for (history_results.items) |item| {
+        allocator.free(item);
+    }
+    history_results.clearRetainingCapacity();
+    
+    // Remove duplicates and add to results
+    for (all_scored.items) |entry| {
+        // Check for duplicates
+        var found = false;
+        for (history_results.items) |existing| {
+            if (std.mem.eql(u8, existing, entry.path)) {
+                found = true;
+                allocator.free(entry.path); // Free duplicate
+                break;
+            }
+        }
+        if (!found) {
+            try history_results.append(allocator, entry.path);
+        }
+    }
+    
+    // Free remaining scored items that weren't added
+    for (all_scored.items) |entry| {
+        var found = false;
+        for (history_results.items) |existing| {
+            if (std.mem.eql(u8, existing, entry.path)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            allocator.free(entry.path);
+        }
+    }
+    all_scored.clearRetainingCapacity();
+    all_scored.deinit(allocator);
 }
