@@ -215,7 +215,8 @@ fn sortFilesystemResults(
     
     // Create scored entries
     var scored = std.ArrayListUnmanaged(ScoredPath){};
-    defer {
+    errdefer {
+        // Only free on error - otherwise ownership transfers to results
         for (scored.items) |entry| {
             allocator.free(entry.path);
         }
@@ -226,6 +227,7 @@ fn sortFilesystemResults(
     for (results.items) |path| {
         const score = calculatePathScore(path, pattern, home);
         const path_copy = try allocator.dupe(u8, path);
+        errdefer allocator.free(path_copy);
         try scored.append(allocator, ScoredPath{
             .path = path_copy,
             .score = score,
@@ -248,7 +250,11 @@ fn sortFilesystemResults(
     }
     results.clearRetainingCapacity();
     
+    // Transfer ownership from scored to results (don't free in defer)
     for (scored.items) |entry| {
         try results.append(allocator, entry.path);
     }
+    // Clear scored without freeing (ownership transferred)
+    scored.clearRetainingCapacity();
+    scored.deinit(allocator);
 }
