@@ -388,15 +388,25 @@ fn mergeAndSortResults(
         });
     }
     
-    // Add filesystem results
+    // Add filesystem results (check for duplicates first)
     for (filesystem_results.items) |path| {
-        const score = calculatePathScore(path, pattern, home);
-        const path_copy = try allocator.dupe(u8, path);
-        errdefer allocator.free(path_copy);
-        try all_scored.append(allocator, ScoredPath{
-            .path = path_copy,
-            .score = score,
-        });
+        // Check if already in history_results
+        var found = false;
+        for (history_results.items) |existing| {
+            if (std.mem.eql(u8, existing, path)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            const score = calculatePathScore(path, pattern, home);
+            const path_copy = try allocator.dupe(u8, path);
+            errdefer allocator.free(path_copy);
+            try all_scored.append(allocator, ScoredPath{
+                .path = path_copy,
+                .score = score,
+            });
+        }
     }
     
     // Sort all by score
@@ -409,41 +419,18 @@ fn mergeAndSortResults(
     const sort_ctx = SortContext{};
     std.mem.sort(ScoredPath, all_scored.items, sort_ctx, SortContext.lessThan);
     
-    // Clear and repopulate history_results with sorted order
+    // Free original history_results items
     for (history_results.items) |item| {
         allocator.free(item);
     }
     history_results.clearRetainingCapacity();
     
-    // Remove duplicates and add to results
+    // Transfer ownership from all_scored to history_results
     for (all_scored.items) |entry| {
-        // Check for duplicates
-        var found = false;
-        for (history_results.items) |existing| {
-            if (std.mem.eql(u8, existing, entry.path)) {
-                found = true;
-                allocator.free(entry.path); // Free duplicate
-                break;
-            }
-        }
-        if (!found) {
-            try history_results.append(allocator, entry.path);
-        }
+        try history_results.append(allocator, entry.path);
     }
     
-    // Free remaining scored items that weren't added
-    for (all_scored.items) |entry| {
-        var found = false;
-        for (history_results.items) |existing| {
-            if (std.mem.eql(u8, existing, entry.path)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            allocator.free(entry.path);
-        }
-    }
+    // Clear all_scored without freeing (ownership transferred)
     all_scored.clearRetainingCapacity();
     all_scored.deinit(allocator);
 }
